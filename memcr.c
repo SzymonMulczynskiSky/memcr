@@ -259,6 +259,16 @@ static int unseize_target(void)
 	return ret;
 }
 
+static inline void create_filesystem_socketname(char * addr, int addr_size, int pid)
+{
+	snprintf(addr, addr_size, "%s/memcr%u", socket_dir, pid);
+}
+
+static inline void create_abstract_socketname(char * addr, int addr_size, int pid)
+{
+	snprintf(addr, addr_size, "#memcr%u", pid);
+}
+
 static int xconnect(int pid)
 {
 	int cd;
@@ -275,9 +285,9 @@ static int xconnect(int pid)
 	addr.sun_family = PF_UNIX;
 
 	if (socket_dir) {
-		snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/memcr%u", socket_dir, pid);
+		create_filesystem_socketname(addr.sun_path, sizeof(addr.sun_path), pid);
 	} else {
-		snprintf(addr.sun_path, sizeof(addr.sun_path), "#memcr%u", pid);
+		create_abstract_socketname(addr.sun_path, sizeof(addr.sun_path), pid);
 		addr.sun_path[0] = '\0';
 	}
 
@@ -908,8 +918,8 @@ static int target_cmd_end(int pid)
 
 static void cleanup_socket(int pid)
 {
-	char socketaddr[32];
-	snprintf(socketaddr, sizeof(socketaddr), "%s/memcr%u", socket_dir, pid);
+	char socketaddr[108];
+	create_filesystem_socketname(socketaddr, sizeof(socketaddr), pid);
 	remove(socketaddr);
 }
 
@@ -1134,9 +1144,9 @@ static int setup_parasite_args(pid_t pid, void *base)
 	pa_dst = (unsigned long *)PARASITE_ARGS_ADDR(base);
 
 	if (socket_dir) {
-		snprintf(pa.addr, sizeof(pa.addr), "%s/memcr%u", socket_dir, pid);
+		create_filesystem_socketname(pa.addr, sizeof(pa.addr), pid);
 	} else {
-		snprintf(pa.addr, sizeof(pa.addr), "#memcr%u", pid);
+		create_abstract_socketname(pa.addr, sizeof(pa.addr), pid);
 	}
 
 	for (i = 0; i < DIV_ROUND_UP(sizeof(struct parasite_args), sizeof(unsigned long)); i++) {
@@ -1320,6 +1330,7 @@ static int execute_parasite(pid_t pid)
 		assert(!ptrace(PTRACE_POKEDATA, pid, sp + i, (void *)saved_stack[i]));
 
 	free(saved_code);
+
 	return 0;
 }
 
