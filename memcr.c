@@ -906,6 +906,13 @@ static int target_cmd_end(int pid)
 	return ret;
 }
 
+static void cleanup_socket(int pid)
+{
+	char socketaddr[32];
+	snprintf(socketaddr, sizeof(socketaddr), "%s/memcr%u", socket_dir, pid);
+	remove(socketaddr);
+}
+
 static long diff_ms(struct timespec *ts)
 {
 	struct timespec tsn;
@@ -996,6 +1003,10 @@ static int cmd_sequencer(pid_t pid)
 	 * handled once previous one (set pages) is done.
 	 */
 	target_cmd_end(pid);
+
+	if (socket_dir) {
+		cleanup_socket(pid);
+	}
 
 	return 0;
 }
