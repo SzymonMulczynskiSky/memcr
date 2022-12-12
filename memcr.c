@@ -1352,7 +1352,7 @@ static void usage(const char *name, int status)
 		"  -h --help\thelp\n" \
 		"  -p --pid\ttarget processs pid\n" \
 		"  -d --dir\tdir where memory dump is stored (defaults to /tmp)\n" \
-		"  -s --parasite-socket-dir\tdir where socket to communicate with parasite is created\n" \
+		"  -S --parasite-socket-dir\tdir where socket to communicate with parasite is created\n" \
 		"        (abstract socket will be used if no path specified)\n" \
 		"  -n --nowait\tno wait for key press\n",
 		name);
@@ -1376,7 +1376,7 @@ int main(int argc, char *argv[])
 	dump_dir = "/tmp";
 	socket_dir = NULL;
 
-	while ((opt = getopt_long(argc, argv, "hvp:d:s:n", long_options, &option_index)) != -1) {
+	while ((opt = getopt_long(argc, argv, "hvp:d:S:n", long_options, &option_index)) != -1) {
 		switch (opt) {
 			case 'h':
 				usage(argv[0], 0);
@@ -1387,7 +1387,7 @@ int main(int argc, char *argv[])
 			case 'd':
 				dump_dir = optarg;
 				break;
-			case 's':
+			case 'S':
 				socket_dir = optarg;
 				break;
 			case 'n':
