@@ -1387,7 +1387,7 @@ static int execute_parasite_restore(pid_t pid)
 	return 0;
 }
 
-static void signal_handler(int signal)
+static void sigint_handler(int signal)
 {
 	if (signal == SIGINT) {
 		interrupted = 1;
@@ -1467,6 +1467,28 @@ static int setup_restore_socket_service(pid_t pid)
 	return rd;
 }
 
+void worker_exit_handler (int sig, siginfo_t *sip, void *notused)
+{
+	int status;
+	if (sip->si_pid == waitpid(sip->si_pid, &status, WNOHANG))
+	{
+		fprintf(stdout, "[+] Worker %d exit.\n", sip->si_pid);
+	}
+}
+
+void sigchld_worker_handler(int signum)
+{
+	pid_t pid;
+	int   status;
+	while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+	{
+		fprintf(stdout, "[%d] SIHCHLD received. Unseizing %d...\n", getpid(), pid);
+		unseize_pid(pid);
+	}
+	fprintf(stdout, "[%d] Tracee killed, worker exit!\n", getpid());
+	exit(0);
+}
+
 static int checkpoint_worker(pid_t pid, int checkpointSocket)
 {
 	int ret = seize_target(pid);
@@ -1482,6 +1504,8 @@ static int checkpoint_worker(pid_t pid, int checkpointSocket)
 		fprintf(stderr, "[%d] Parasite checkpoint failed!\n", getpid());
 		return ret;
 	}
+
+	signal(SIGCHLD, sigchld_worker_handler);
 
 	return 0;
 }
@@ -1502,6 +1526,8 @@ static int restore_worker(int rd)
 	}
 
 	fprintf(stdout, "[%d] Worker received RESTORE command for %d.\n", getpid(), post_checkpoint_cmd.pid);
+
+	signal(SIGCHLD, SIG_DFL);
 
 	ret = execute_parasite_restore(post_checkpoint_cmd.pid);
 	if (ret)
@@ -1683,6 +1709,21 @@ static int handle_connection(int cd)
 	return ret;
 }
 
+void register_signal_handlers()
+{
+	struct sigaction sigchld_action, sigint_action;
+
+	sigchld_action.sa_sigaction = worker_exit_handler;
+	sigfillset(&sigchld_action.sa_mask);
+	sigchld_action.sa_flags = SA_SIGINFO | SA_NOCLDSTOP | SA_RESTART;
+
+	sigint_action.sa_handler = sigint_handler;
+	sigfillset(&sigint_action.sa_mask);
+
+	sigaction(SIGCHLD, &sigchld_action, NULL);
+	sigaction(SIGINT, &sigint_action, NULL);
+}
+
 int main(int argc, char *argv[])
 {
 	int ret;
@@ -1721,9 +1762,9 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	signal(SIGINT, signal_handler);
-
 	fprintf(stdout, "Starting memcr service. Dumps will be stored in: %s\n", dump_dir);
+
+	register_signal_handlers();
 
 	srvd = socket(PF_UNIX, SOCK_STREAM, 0);
 	if (srvd < 0) {
@@ -1764,4 +1805,5 @@ int main(int argc, char *argv[])
 
 	return interrupted ? 1 : 0;
 }
+
 
