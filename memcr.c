@@ -99,6 +99,11 @@ static int nr_vmas;
 static pid_t parasite_pid;
 static struct target_context ctx;
 
+#define CHECKPOINTED_PIDS_NBR 16
+#define PID_INVALID           0
+static pid_t checkpointed_pids[CHECKPOINTED_PIDS_NBR] = {};
+static pid_t checkpoint_workers[CHECKPOINTED_PIDS_NBR] = {};
+
 static int interrupted;
 
 /*
@@ -106,6 +111,59 @@ static int interrupted;
  * (SIGTRAP | PTRACE_EVENT_foo << 8).
  */
 #define SI_EVENT(si_code)	(((si_code) & 0xFF00) >> 8)
+
+static int is_pid_checkpointed(pid_t pid)
+{
+	for(int i=0; i<CHECKPOINTED_PIDS_NBR; ++i)
+	{
+		if(checkpointed_pids[i] == pid)
+		{
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static void set_pid_checkpointed(pid_t pid, pid_t worker)
+{
+	if (is_pid_checkpointed(pid))
+		return;
+
+	for(int i=0; i<CHECKPOINTED_PIDS_NBR; ++i)
+	{
+		if(checkpointed_pids[i] == PID_INVALID)
+		{
+			checkpointed_pids[i] = pid;
+			checkpoint_workers[i] = worker;
+			return;
+		}
+	}
+	fprintf(stderr, "Checkpointed PIDs limit exceeded!\n");
+}
+
+static void clear_pid_checkpointed(pid_t pid)
+{
+	for(int i=0; i<CHECKPOINTED_PIDS_NBR; ++i)
+	{
+		if(checkpointed_pids[i] == pid)
+		{
+			checkpointed_pids[i] = PID_INVALID;
+		}
+	}
+}
+
+static void clear_pid_on_worker_exit(pid_t worker)
+{
+	for(int i=0; i<CHECKPOINTED_PIDS_NBR; ++i)
+	{
+		if(checkpoint_workers[i] == worker)
+		{
+			checkpointed_pids[i] = PID_INVALID;
+			checkpoint_workers[i] = PID_INVALID;
+		}
+	}
+}
 
 static int iterate_pstree(pid_t pid, int skip_self, int max_threads, int (*callback)(pid_t pid))
 {
@@ -1473,6 +1531,7 @@ void worker_exit_handler (int sig, siginfo_t *sip, void *notused)
 	if (sip->si_pid == waitpid(sip->si_pid, &status, WNOHANG))
 	{
 		fprintf(stdout, "[+] Worker %d exit.\n", sip->si_pid);
+		clear_pid_on_worker_exit(sip->si_pid);
 	}
 }
 
@@ -1657,6 +1716,13 @@ static int handle_connection(int cd)
 		case MEMCR_CHECKPOINT: {
 			fprintf(stdout, "[+] got MEMCR_CHECKPOINT for %d.\n", svc_cmd.pid);
 
+			if (is_pid_checkpointed(svc_cmd.pid))
+			{
+				fprintf(stdout, "[i] Process %d is already checkpointed!\n", svc_cmd.pid);
+				send_response_to_client(cd, MEMCR_OK);
+				break;
+			}
+
 			int checkpoint_resp_sockets[2];
 
 			ret = socketpair(AF_UNIX, SOCK_STREAM, 0, checkpoint_resp_sockets);
@@ -1677,6 +1743,7 @@ static int handle_connection(int cd)
 			}
 			else if (forkpid > 0) // parent
 			{
+				set_pid_checkpointed(svc_cmd.pid, forkpid);
 				close(checkpoint_resp_sockets[1]);
 
 				parent_checkpoint_procedure(checkpoint_resp_sockets[0], cd);
@@ -1691,8 +1758,16 @@ static int handle_connection(int cd)
 		case MEMCR_RESTORE: {
 			fprintf(stdout, "[+] got MEMCR_RESTORE for %d.\n", svc_cmd.pid);
 
+			if (!is_pid_checkpointed(svc_cmd.pid))
+			{
+				fprintf(stdout, "[i] Process %d is not checkpointed!\n", svc_cmd.pid);
+				send_response_to_client(cd, MEMCR_OK);
+				break;
+			}
+
 			parent_restore_procedure(cd, svc_cmd);
 
+			clear_pid_checkpointed(svc_cmd.pid);
 			break;
 		}
 		case MEMCR_EXIT: {
@@ -1805,5 +1880,4 @@ int main(int argc, char *argv[])
 
 	return interrupted ? 1 : 0;
 }
-
 
