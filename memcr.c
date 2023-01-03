@@ -82,6 +82,7 @@ static char *dump_dir;
 static char *socket_dir;
 static int nowait;
 static int finish = 0;
+static int procedure_timeout = 60; // seconds
 
 #define PATH_MAX        4096	/* # chars in a path name including nul */
 #define MAX_THREADS		1024
@@ -163,6 +164,18 @@ static void clear_pid_on_worker_exit(pid_t worker)
 			checkpoint_workers[i] = PID_INVALID;
 		}
 	}
+}
+
+static pid_t get_worker(pid_t pid)
+{
+	for(int i=0; i<CHECKPOINTED_PIDS_NBR; ++i)
+	{
+		if(checkpointed_pids[i] == pid)
+		{
+			return checkpoint_workers[i];
+		}
+	}
+	return 0;
 }
 
 static int iterate_pstree(pid_t pid, int skip_self, int max_threads, int (*callback)(pid_t pid))
@@ -1596,6 +1609,16 @@ static int restore_worker(int rd)
 	return ret;
 }
 
+static void * checkpoint_guard_timer(void * worker_ptr)
+{
+	pid_t worker = *(pid_t*) worker_ptr;
+	fprintf(stdout, "[+] ... Guard timer %ds started for %d.\n", procedure_timeout, worker);
+	sleep(procedure_timeout);
+	fprintf(stdout, "[!] ... Worker %d is not responding, procedure will be interrupted!\n", worker);
+	kill(worker, SIGKILL);
+	return NULL;
+}
+
 static int application_worker(pid_t pid, int checkpoint_resp_socket)
 {
 	int rsd, rd, ret = 0;
@@ -1743,10 +1766,17 @@ static int handle_connection(int cd)
 			}
 			else if (forkpid > 0) // parent
 			{
+				pthread_t guard;
+
 				set_pid_checkpointed(svc_cmd.pid, forkpid);
 				close(checkpoint_resp_sockets[1]);
 
+				pthread_create(&guard, NULL, checkpoint_guard_timer, &forkpid);
+				pthread_detach(guard);
+
 				parent_checkpoint_procedure(checkpoint_resp_sockets[0], cd);
+
+				pthread_cancel(guard);
 			}
 			else
 			{
@@ -1757,6 +1787,7 @@ static int handle_connection(int cd)
 		}
 		case MEMCR_RESTORE: {
 			fprintf(stdout, "[+] got MEMCR_RESTORE for %d.\n", svc_cmd.pid);
+			pthread_t guard;
 
 			if (!is_pid_checkpointed(svc_cmd.pid))
 			{
@@ -1765,7 +1796,12 @@ static int handle_connection(int cd)
 				break;
 			}
 
+			pid_t worker = get_worker(svc_cmd.pid);
+			pthread_create(&guard, NULL, checkpoint_guard_timer, &worker);
+			pthread_detach(guard);
+
 			parent_restore_procedure(cd, svc_cmd);
+			pthread_cancel(guard);
 
 			clear_pid_checkpointed(svc_cmd.pid);
 			break;
