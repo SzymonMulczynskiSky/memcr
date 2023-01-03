@@ -80,7 +80,6 @@ struct vm_area {
 
 static char *dump_dir;
 static char *socket_dir;
-static int nowait;
 static int finish = 0;
 static int procedure_timeout = 60; // seconds
 
@@ -1477,7 +1476,7 @@ static void usage(const char *name, int status)
 		"  -d --dir\tdir where memory dump is stored (defaults to /tmp)\n" \
 		"  -S --parasite-socket-dir\tdir where socket to communicate with parasite is created\n" \
 		"        (abstract socket will be used if no path specified)\n" \
-		"  -n --nowait\tno wait for key press\n",
+		"  -T --procedure-timeout\ttimeout for checkpoint / restore procedure (60s by default)\n",
 		name);
 	exit(status);
 }
@@ -1847,14 +1846,14 @@ int main(int argc, char *argv[])
 		{ "help",			0,	0,	0},
 		{ "dir",			1,	0,	0},
 		{ "parasite-socket-dir",	1,	0,	0},
-		{ "nowait",			0,	0,	0},
+		{ "procedure-timeout",	1,	0,	0},
 		{ NULL,			0,	0,	0}
 	};
 
 	dump_dir = "/tmp";
 	socket_dir = NULL;
 
-	while ((opt = getopt_long(argc, argv, "hvp:d:S:n", long_options, &option_index)) != -1) {
+	while ((opt = getopt_long(argc, argv, "hvd:S:T:", long_options, &option_index)) != -1) {
 		switch (opt) {
 			case 'h':
 				usage(argv[0], 0);
@@ -1865,8 +1864,8 @@ int main(int argc, char *argv[])
 			case 'S':
 				socket_dir = optarg;
 				break;
-			case 'n':
-				nowait = 1;
+			case 'T':
+				procedure_timeout = atoi(optarg);
 				break;
 			default: /* '?' */
 				usage(argv[0], 1);
