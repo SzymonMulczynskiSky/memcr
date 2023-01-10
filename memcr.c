@@ -1467,6 +1467,11 @@ static void sigint_handler(int signal)
 	}
 }
 
+static void sigpipe_handler(int sig, siginfo_t *sip, void *notused)
+{
+	fprintf(stdout, "[!] program received SIGPIPE from %d.\n", sip->si_pid);
+}
+
 static void usage(const char *name, int status)
 {
 	fprintf(status ? stderr : stdout,
@@ -1821,16 +1826,21 @@ static int handle_connection(int cd)
 
 void register_signal_handlers()
 {
-	struct sigaction sigchld_action, sigint_action;
+	struct sigaction sigchld_action, sigint_action, sigpipe_action;
 
 	sigchld_action.sa_sigaction = worker_exit_handler;
 	sigfillset(&sigchld_action.sa_mask);
 	sigchld_action.sa_flags = SA_SIGINFO | SA_NOCLDSTOP | SA_RESTART;
 
+	sigpipe_action.sa_sigaction = sigpipe_handler;
+	sigfillset(&sigpipe_action.sa_mask);
+	sigpipe_action.sa_flags = SA_SIGINFO;
+
 	sigint_action.sa_handler = sigint_handler;
 	sigfillset(&sigint_action.sa_mask);
 
 	sigaction(SIGCHLD, &sigchld_action, NULL);
+	sigaction(SIGPIPE, &sigpipe_action, NULL);
 	sigaction(SIGINT, &sigint_action, NULL);
 }
 
@@ -1915,4 +1925,3 @@ int main(int argc, char *argv[])
 
 	return interrupted ? 1 : 0;
 }
-
