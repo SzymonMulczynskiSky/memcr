@@ -108,6 +108,44 @@ static int interrupted;
  */
 #define SI_EVENT(si_code)	(((si_code) & 0xFF00) >> 8)
 
+#define CHECKPOINTED_PIDS_LIMIT 16
+#define PID_INVALID		0
+static pid_t checkpointed_pids[CHECKPOINTED_PIDS_LIMIT] = {};
+
+static int is_pid_checkpointed(pid_t pid)
+{
+	for(int i=0; i<CHECKPOINTED_PIDS_LIMIT; ++i) {
+		if(checkpointed_pids[i] == pid) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+static void set_pid_checkpointed(pid_t pid)
+{
+	if (is_pid_checkpointed(pid))
+		return;
+
+	for(int i=0; i<CHECKPOINTED_PIDS_LIMIT; ++i) {
+		if(checkpointed_pids[i] == PID_INVALID) {
+			checkpointed_pids[i] = pid;
+			return;
+		}
+	}
+	fprintf(stderr, "Checkpointed PIDs limit exceeded!\n");
+}
+
+static void clear_pid_checkpointed(pid_t pid)
+{
+	for(int i=0; i<CHECKPOINTED_PIDS_LIMIT; ++i) {
+		if(checkpointed_pids[i] == pid) {
+			checkpointed_pids[i] = PID_INVALID;
+		}
+	}
+}
+
 static int iterate_pstree(pid_t pid, int skip_self, int max_threads, int (*callback)(pid_t pid))
 {
 	int ret;
@@ -1424,6 +1462,84 @@ static int send_response_to_client(int cd, memcr_svc_response resp_code)
 	return 0;
 }
 
+static int send_response_to_service(int fd, int status)
+{
+	struct service_response svc_resp = { .resp_code = MEMCR_OK };
+
+	if (status)
+		svc_resp.resp_code = MEMCR_ERROR;
+
+	fprintf(stdout, "[%d] Sending %s response.\n", getpid(), (status ? "ERROR" : "OK"));
+	int ret = xwrite(fd, &svc_resp, sizeof(struct service_response));
+	if (ret != sizeof(svc_resp))
+		return -1;
+
+	return 0;
+}
+
+static struct sockaddr_un make_restore_socket_address(pid_t pid)
+{
+	struct sockaddr_un addr_restore;
+	addr_restore.sun_family = PF_UNIX;
+	memset(addr_restore.sun_path, 0, sizeof(addr_restore.sun_path));
+	snprintf(addr_restore.sun_path, sizeof(addr_restore.sun_path), "#memcrRestore%u", pid);
+	addr_restore.sun_path[0] = '\0';
+
+	return addr_restore;
+}
+
+static int setup_internal_socket_worker(pid_t pid)
+{
+	int ret, rsd;
+	struct sockaddr_un addr_restore = make_restore_socket_address(pid);
+
+	rsd = socket(PF_UNIX, SOCK_STREAM, 0);
+	if (rsd < 0) {
+		fprintf(stderr, "%s() failed on socket setup.\n", __func__);
+		return rsd;
+	}
+
+	ret = bind(rsd, (struct sockaddr *)&addr_restore, sizeof(addr_restore));
+	if (ret < 0) {
+		fprintf(stderr, "%s() failed on socket bind.\n", __func__);
+		return ret;
+	}
+	ret = listen(rsd, 8);
+	if (ret < 0) {
+		fprintf(stderr, "%s() failed on socket listen.\n", __func__);
+		return ret;
+	}
+
+	return rsd;
+}
+
+static int setup_internal_socket_service(pid_t pid)
+{
+	int rd, ret, cnt;
+	struct sockaddr_un addr_restore = make_restore_socket_address(pid);
+
+	rd = socket(PF_UNIX, SOCK_STREAM, 0);
+	if (rd < 0) {
+		fprintf(stderr, "socket() %s failed: %m\n", addr_restore.sun_path + 1);
+		return rd;
+	}
+
+	/* worker needs some time to start listening on a socket */
+retry:
+	ret = connect(rd, (struct sockaddr *)&addr_restore, sizeof(struct sockaddr_un));
+	if (ret < 0) {
+		if (cnt++ < 100) {
+			usleep(1*1000);
+			goto retry;
+		} else {
+			fprintf(stderr, "connect() to %s failed: %m\n", addr_restore.sun_path + 1);
+			close(rd);
+			return ret;
+		}
+	}
+	return rd;
+}
+
 static int checkpoint_worker(pid_t pid)
 {
 	int ret;
@@ -1436,16 +1552,134 @@ static int checkpoint_worker(pid_t pid)
 	return ret;
 }
 
-static int restore_worker(pid_t pid)
+static int restore_worker(int rd)
 {
 	int ret;
+	struct service_command post_checkpoint_cmd;
 
-	ret = execute_parasite_restore(pid);
+	ret = read_command(rd, &post_checkpoint_cmd);
+
+	if (ret < 0 || MEMCR_RESTORE != post_checkpoint_cmd.cmd) {
+		fprintf(stdout, "[%d] Error reading restore command!\n", getpid());
+		return -1;
+	}
+
+	fprintf(stdout, "[%d] Worker received RESTORE command for %d.\n", getpid(), post_checkpoint_cmd.pid);
+
+	ret = execute_parasite_restore(post_checkpoint_cmd.pid);
 	if (ret)
 		return ret;
 
 	ret = unseize_target();
 	return ret;
+}
+
+static int application_worker(pid_t pid)
+{
+	int rsd, rd, ret = 0;
+
+	fprintf(stdout, "[%d] memcr worker is started to checkpoint %d.\n", getpid(), pid);
+
+	rsd = setup_internal_socket_worker(pid);
+	if (rsd < 0)
+		return rsd;
+
+	rd = accept(rsd, NULL, NULL);
+	if (rd < 0) {
+		fprintf(stderr, "%s() failed on socket accept, checkpoint resp.\n", __func__);
+		close(rsd);
+		return rd;
+	}
+
+	ret |= checkpoint_worker(pid);
+	ret |= send_response_to_service(rd, ret); // send resp to service
+	close(rd);
+
+	if (ret) {
+		fprintf(stderr, "[%d] Process %d checkpoint failed! Aborting procedure.\n", getpid(), pid);
+		close(rsd);
+		return ret;
+	}
+
+	fprintf(stdout, "[%d] Waiting for restore command...\n", getpid());
+
+	rd = accept(rsd, NULL, NULL);
+	if (rd < 0) {
+		fprintf(stderr, "%s() failed on socket accept, restore.\n", __func__);
+		close(rsd);
+		return rd;
+	}
+
+	ret |= restore_worker(rd);
+	ret |= send_response_to_service(rd, ret);
+
+	close(rd);
+	close(rsd);
+	fprintf(stdout, "[%d] Worker ends.\n", getpid());
+
+	return ret;
+}
+
+static void checkpoint_procedure_service(pid_t pid, int cd)
+{
+	int ret, rd;
+	struct service_response svc_resp;
+
+	fprintf(stdout, "[+] Parent waiting for worker checkpoint...\n");
+	rd = setup_internal_socket_service(pid);
+	if (rd < 0) {
+		fprintf(stderr, "[!] Error in setup checkpoint connection to worker!\n");
+		ret = -1;
+	}
+	ret |= xread(rd, &svc_resp, sizeof(svc_resp)); // receive resp from worker
+	close(rd);
+
+	if (ret == sizeof(svc_resp))
+	{
+		fprintf(stdout, "[+] Parent received checkpoint response, informing client...\n");
+		send_response_to_client(cd, svc_resp.resp_code);
+	}
+	else
+	{
+		fprintf(stderr, "[!] Error reading checkpoint response from worker!\n");
+		send_response_to_client(cd, MEMCR_ERROR);
+	}
+}
+
+static void restore_procedure_service(int cd, struct service_command svc_cmd)
+{
+	int rd, ret = 0;
+	struct service_response svc_resp;
+
+	rd = setup_internal_socket_service(svc_cmd.pid);
+	if (rd < 0) {
+		fprintf(stderr, "[!] Error in setup restore connection to worker!\n");
+		ret = -1;
+	}
+
+	ret = xwrite(rd, &svc_cmd, sizeof(struct service_command)); // send restore to service
+	if (ret != sizeof(struct service_command)) {
+		fprintf(stderr, "%s() xwrite() svc_cmd failed: ret %d\n", __func__, ret);
+		ret = -1;
+	}
+
+	fprintf(stdout, "[+] Service waiting for worker to restore... \n");
+
+	ret = xread(rd, &svc_resp, sizeof(struct service_response));   // read response from service
+	close(rd);
+	if (ret != sizeof(struct service_response)) {
+		fprintf(stderr, "%s() xread() svc_resp failed: ret %d\n", __func__, ret);
+		ret = -1;
+	}
+
+	if (-1 == ret || MEMCR_OK != svc_resp.resp_code) {
+		fprintf(stderr, "[!] There were errors during restore procedure, sending ERROR response to client!\n");
+		send_response_to_client(cd, MEMCR_ERROR);
+	}
+	else {
+		fprintf(stdout, "[i] Restore procedure finished. Sending OK response to client.\n");
+		send_response_to_client(cd, MEMCR_OK);
+	}
 }
 
 static int handle_connection(int cd)
@@ -1464,29 +1698,47 @@ static int handle_connection(int cd)
 		case MEMCR_CHECKPOINT: {
 			fprintf(stdout, "[+] got MEMCR_CHECKPOINT for %d.\n", svc_cmd.pid);
 
-			if (target_pid) {
-				fprintf(stdout, "[i] A Process is already checkpointed!\n");
-				send_response_to_client(cd, MEMCR_ERROR);
+			if (is_pid_checkpointed(svc_cmd.pid)) {
+				fprintf(stdout, "[i] Process %d is already checkpointed!\n", svc_cmd.pid);
+				send_response_to_client(cd, MEMCR_OK);
 				break;
 			}
 
-			ret = checkpoint_worker(svc_cmd.pid);
-			ret |= send_response_to_client(cd, ret ? MEMCR_ERROR : MEMCR_OK);
-			target_pid = svc_cmd.pid;
+			if (ret < 0) {
+				fprintf(stderr, "%s(): Error in socketpair creation!\n", __func__);
+				return ret;
+			}
+
+			pid_t forkpid = fork();
+			if (0 == forkpid) {
+				close(cd);
+
+				ret = application_worker(svc_cmd.pid);
+				exit(ret);
+			}
+			else if (forkpid > 0) {
+				set_pid_checkpointed(svc_cmd.pid);
+
+				checkpoint_procedure_service(svc_cmd.pid, cd);
+			}
+			else {
+				fprintf(stderr, "%s(): Fork error!\n", __func__);
+			}
+
 			break;
 		}
 		case MEMCR_RESTORE: {
 			fprintf(stdout, "[+] got MEMCR_RESTORE for %d.\n", svc_cmd.pid);
 
-			if (target_pid != svc_cmd.pid) {
+			if (!is_pid_checkpointed(svc_cmd.pid)) {
 				fprintf(stdout, "[i] Process %d is not checkpointed!\n", svc_cmd.pid);
-				ret = send_response_to_client(cd, MEMCR_ERROR);
+				send_response_to_client(cd, MEMCR_OK);
 				break;
 			}
 
-			ret = restore_worker(svc_cmd.pid);
-			ret |= send_response_to_client(cd, ret ? MEMCR_ERROR : MEMCR_OK);
-			target_pid = 0;
+			restore_procedure_service(cd, svc_cmd);
+
+			clear_pid_checkpointed(svc_cmd.pid);
 			break;
 		}
 		default:
@@ -1616,6 +1868,7 @@ int main(int argc, char *argv[])
 	}
 
 	signal(SIGINT, signal_handler);
+	signal(SIGCHLD, SIG_IGN);
 
 	if (listen_port > 0) {
 		ret = service_mode(listen_port);
