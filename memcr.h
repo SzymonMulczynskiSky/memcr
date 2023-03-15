@@ -25,6 +25,8 @@
 #define PAGE_SIZE 4096
 #endif
 
+#define PAGE_CRC
+
 struct parasite_args {
 	char addr[108]; /* abstract or filesystem socket address */
 };

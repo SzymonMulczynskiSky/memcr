@@ -806,6 +806,32 @@ static int target_mprotect(int cd, unsigned long addr, size_t len, unsigned long
 	return 0;
 }
 
+#if defined(PAGE_CRC)
+static uint16_t crc16_ccitt(const char *data, unsigned long length)
+{
+    uint16_t crc;
+    uint8_t buf;
+    int i, j;
+
+    crc = 0xFFFF;
+
+    for (i = 0; i < length; i++) {
+        buf = data[i];
+
+        for (j = 0; j < 8; j++) {
+            if (((crc & 0x8000) >> 8) ^ (buf & 0x80))
+                crc = (crc << 1) ^ 0x8005;
+            else
+                crc = (crc << 1);
+
+            buf <<= 1;
+        }
+    }
+
+    return crc;
+}
+#endif // PAGE_CRC
+
 static int get_mem_region(int md, int cd, unsigned long addr, unsigned long len, int fd)
 {
 	int ret;
@@ -830,6 +856,14 @@ static int get_mem_region(int md, int cd, unsigned long addr, unsigned long len,
 	ret = _write(fd, &buf, len);
 	if (ret != len)
 		return -1;
+
+#if defined PAGE_CRC
+	uint16_t checksum = crc16_ccitt(buf, len);
+	ret = _write(fd, &checksum, sizeof(uint16_t));
+	if (ret != sizeof(uint16_t))
+		return -1;
+	fprintf(stdout, "[+] Checksum = %x.\n", checksum);
+#endif // PAGE_CRC
 
 	ret = parasite_write(cd, &req, sizeof(req));
 	if (ret != sizeof(req))
@@ -862,6 +896,14 @@ static int get_target_mem_region(int cd, unsigned long addr, unsigned long len, 
 	ret = _write(fd, &buf, len);
 	if (ret != len)
 		return -1;
+
+#if defined PAGE_CRC
+	uint16_t checksum = crc16_ccitt(buf, len);
+	ret = _write(fd, &checksum, sizeof(uint16_t));
+	if (ret != sizeof(uint16_t))
+		return -1;
+	fprintf(stdout, "[+] Checksum = %x.\n", checksum);
+#endif // PAGE_CRC
 
 	return 0;
 }
@@ -1166,6 +1208,20 @@ static int target_set_pages(pid_t pid)
 
 		req.vmr = vmr;
 		req.flags = 0;
+
+#if defined PAGE_CRC
+		uint16_t checksum_read;
+		uint16_t checksum_calc = crc16_ccitt(buf, vmr.len);
+
+		ret = _read(fd, &checksum_read, sizeof(uint16_t));
+		if (ret == 0)
+			break;
+
+		if (checksum_calc != checksum_read) {
+			fprintf(stderr, "[!] Checksum error: %x, should be %x.\n", checksum_calc, checksum_read);
+			break;
+		}
+#endif // PAGE_CRC
 
 		ret = parasite_write(cd, &req, sizeof(req));
 		if (ret != sizeof(req)) {
