@@ -51,6 +51,8 @@
 #include "arch/enter.h"
 #include "parasite-blob.h"
 
+#include "minilzo/minilzo.h"
+
 #define NT_PRSTATUS 1
 
 #define __round_mask(x, y) ((__typeof__(x))((y)-1))
@@ -66,6 +68,11 @@
 #define PARASITE_ARGS_ADDR(start)	(((char *)start) + parasite_blob_offset__parasite_args)
 
 #define __DEBUG__ fprintf(stderr, "%s: %s() +%d\n", __FILE__, __func__, __LINE__);
+
+#define HEAP_ALLOC(var,size) \
+    lzo_align_t __LZO_MMODEL var [ ((size) + (sizeof(lzo_align_t) - 1)) / sizeof(lzo_align_t) ]
+
+static HEAP_ALLOC(wrkmem, LZO1X_1_MEM_COMPRESS);
 
 
 #define PROT_NONE	0x0
@@ -124,6 +131,8 @@ static struct vm_area vmas[MAX_VMAS];
 static int nr_vmas;
 
 #define MAX_VM_REGION_SIZE (256 * PAGE_SIZE)
+#define IN_LEN 	    MAX_VM_REGION_SIZE
+#define OUT_LEN     (IN_LEN + IN_LEN / 16 + 64 + 3)
 
 static pid_t parasite_pid;
 static pid_t parasite_pid_clone;
@@ -846,7 +855,6 @@ static int get_target_mem_region(int cd, unsigned long addr, unsigned long len, 
 		.vmr.len = len,
 		.flags = flags,
 	};
-	char buf[MAX_VM_REGION_SIZE];
 
 	ret = parasite_write(cd, &req, sizeof(req));
 	if (ret != sizeof(req))
@@ -855,12 +863,39 @@ static int get_target_mem_region(int cd, unsigned long addr, unsigned long len, 
 	if (!(req.flags & VM_REGION_TX))
 		return 0;
 
-	ret = parasite_read(cd, &buf, len);
+
+//======================================================
+	lzo_uint in_len = len;
+	lzo_uint out_len;
+
+	static unsigned char __LZO_MMODEL in  [ IN_LEN ];
+	static unsigned char __LZO_MMODEL out [ OUT_LEN ];
+//=======================================================
+
+	ret = parasite_read(cd, &in, len);
 	if (ret != len)
 		return -1;
 
-	ret = _write(fd, &buf, len);
-	if (ret != len)
+	ret = lzo1x_1_compress(in, in_len, out, &out_len, wrkmem);
+	if (ret == LZO_E_OK)
+		fprintf(stdout, "compressed %lu bytes into %lu bytes\n",
+			(unsigned long) in_len, (unsigned long) out_len);
+	else {
+		fprintf(stderr, "internal error - compression failed: %d\n", ret);
+		return -1;
+	}
+
+	/* check for an incompressible block */
+	if (out_len >= in_len) {
+		fprintf(stdout, "This block contains incompressible data.\n");
+	}
+
+    	ret = _write(fd, &out_len, sizeof(out_len));
+    	if (ret != sizeof(out_len))
+    		return -1;
+
+	ret = _write(fd, &out, out_len);
+	if (ret != out_len)
 		return -1;
 
 	return 0;
@@ -1153,21 +1188,43 @@ static int target_set_pages(pid_t pid)
 		goto out;
 	}
 
+//======================================================
+	lzo_uint in_len;
+	lzo_uint new_len;
+
+	static unsigned char __LZO_MMODEL in  [ IN_LEN ];
+	static unsigned char __LZO_MMODEL out [ OUT_LEN ];
+
+//=======================================================
 	while (1) {
 		struct vm_region vmr;
 		struct vm_region_req req;
-		char buf[MAX_VM_REGION_SIZE];
 
 		ret = _read(fd, &vmr, sizeof(vmr));
 		if (ret == 0)
 			break;
 
-		ret = _read(fd, &buf, vmr.len);
+		req.vmr = vmr;
+		req.flags = 0;
+
+		ret = _read(fd, &in_len, sizeof(in_len));
 		if (ret == 0)
 			break;
 
-		req.vmr = vmr;
-		req.flags = 0;
+		ret = _read(fd, &in, in_len);
+		if (ret == 0)
+			break;
+
+
+		ret = lzo1x_decompress(in, in_len, out, &new_len, NULL);
+		if (ret == LZO_E_OK && new_len == vmr.len)
+			fprintf(stdout, "decompressed %lu bytes back into %lu bytes\n",
+				(unsigned long) in_len, (unsigned long) new_len);
+		else {
+			/* this should NEVER happen */
+			fprintf(stderr, "internal error - decompression failed: %d\n", ret);
+			goto out;
+		}
 
 		ret = parasite_write(cd, &req, sizeof(req));
 		if (ret != sizeof(req)) {
@@ -1175,7 +1232,7 @@ static int target_set_pages(pid_t pid)
 			break;
 		}
 
-		ret = parasite_write(cd, &buf, vmr.len);
+		ret = parasite_write(cd, &out, vmr.len);
 		if (ret != vmr.len) {
 			ret = -1;
 			break;
@@ -2194,6 +2251,9 @@ int main(int argc, char *argv[])
 	kpageflags_fd = open("/proc/kpageflags", O_RDONLY);
 	if (kpageflags_fd == -1)
 		die("/proc/kpageflags: %m\n");
+
+	if (lzo_init() != LZO_E_OK)
+		die("internal error - lzo_init() failed!\n");
 
 	register_signal_handlers();
 
