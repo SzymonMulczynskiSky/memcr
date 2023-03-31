@@ -50,6 +50,10 @@
 #include <lz4.h>
 #endif
 
+#include <md5.h>
+
+static uint8_t dump_md5[16];
+
 #include "memcr.h"
 #include "arch/cpu.h"
 #include "arch/enter.h"
@@ -825,6 +829,10 @@ static int compress_lz4_and_write(const char *buf, unsigned long len, int fd)
 	if (dstSize == 0)
 		return -1;
 
+	uint8_t checksum[16];
+	md5String(compr, checksum);
+	fprintf(stdout, "--> DEDEBUG Calculated sieksum starts with %x\n", checksum[0]);
+
 	ret = _write(fd, &dstSize, sizeof(dstSize));
 	if (ret != sizeof(dstSize))
 		return -1;
@@ -1320,11 +1328,13 @@ static int cmd_checkpoint(pid_t pid)
 	fprintf(stdout, "[+] downloading pages\n");
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	ret = get_target_pages(pid, vmas, nr_vmas);
+
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/pages-%d.img", dump_dir, pid);
+
 	if (ret) {
 		fprintf(stderr, "get_target_pages() failed\n");
 
-		char path[PATH_MAX];
-		snprintf(path, sizeof(path), "%s/pages-%d.img", dump_dir, pid);
 		unlink(path);
 
 		if (parasite_socket_dir)
@@ -1333,8 +1343,19 @@ static int cmd_checkpoint(pid_t pid)
 		return ret;
 	}
 
+	// FILE * f = fopen(path, "r");
+	// if (!f)
+	// 	fprintf(stderr, "No file, but how???\n");
+
+	// md5File(f, dump_md5);
+	// fclose(f);
+	// fprintf(stdout, "dump calculated md5: %d %d %d ... %d", dump_md5[0], dump_md5[1], dump_md5[2], dump_md5[15]);
+
+
 	fprintf(stdout, "[i] download took %lu ms\n", diff_ms(&ts));
 	fprintf(stdout, "[i] stored at %s/pages-%d.img\n", dump_dir, pid);
+
+
 
 	get_target_rss(pid, &vms_b);
 
@@ -1356,6 +1377,19 @@ static int cmd_restore(pid_t pid)
 
 	fprintf(stdout, "[+] uploading pages\n");
 	clock_gettime(CLOCK_MONOTONIC, &ts);
+
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/pages-%d.img", dump_dir, pid);
+
+	FILE * f = fopen(path, "r");
+	if (!f)
+		fprintf(stderr, "No file, but how???\n");
+
+	md5File(f, dump_md5);
+	fclose(f);
+	fprintf(stdout, "dump calculated md5: %d %d %d ... %d", dump_md5[0], dump_md5[1], dump_md5[2], dump_md5[15]);
+
+
 	target_set_pages(pid);
 	fprintf(stdout, "[i] upload took %lu ms\n", diff_ms(&ts));
 
